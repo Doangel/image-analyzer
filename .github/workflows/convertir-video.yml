@@ -18,8 +18,8 @@ jobs:
       - name: Instalar AWS CLI (para hablar con R2)
         run: |
           curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-          unzip -q awscliv2.zip
-          sudo ./aws/install
+          unzip -q -o awscliv2.zip
+          sudo ./aws/install --update
 
       - name: Configurar credenciales de R2
         run: |
