@@ -35,6 +35,7 @@ jobs:
       - name: Pedirle al sitio los datos de este video
         run: |
           curl -sf "https://vixyra.vip/api-conversion.php?id=${{ matrix.video_id }}" \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
             -H "X-Secret: ${{ secrets.CONVERT_SECRET }}" \
             -o info.json
           cat info.json
@@ -75,6 +76,7 @@ jobs:
           ESTADO="listo"
           if [ "${{ job.status }}" != "success" ]; then ESTADO="error"; fi
           curl -s -X POST "https://vixyra.vip/api-conversion.php" \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
             -H "Content-Type: application/json" \
             -H "X-Secret: ${{ secrets.CONVERT_SECRET }}" \
             -d "{\"video_id\": ${{ matrix.video_id }}, \"status\": \"$ESTADO\", \"hls_key\": \"$HLS_KEY\"}"
