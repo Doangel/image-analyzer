@@ -1,0 +1,140 @@
+name: Convertir video a HLS
+
+on:
+  repository_dispatch:
+    types: [convertir_video]
+
+jobs:
+  convertir:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        video: ${{ fromJson(toJson(github.event.client_payload.videos)) }}
+    steps:
+      - name: Instalar ffmpeg y jq
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg jq
+
+      - name: Instalar AWS CLI (para hablar con R2)
+        run: |
+          curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+          unzip -q -o awscliv2.zip
+          sudo ./aws/install --update
+
+      - name: Configurar credenciales de R2
+        run: |
+          mkdir -p ~/.aws
+          cat <<CREDS > ~/.aws/credentials
+          [default]
+          aws_access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CREDS
+          echo "[default]" > ~/.aws/config
+          echo "region = auto" >> ~/.aws/config
+
+      - name: Descargar el archivo crudo desde R2
+        run: |
+          OBJECT_KEY="${{ matrix.video.object_key }}"
+          echo "OBJECT_KEY=$OBJECT_KEY" >> "$GITHUB_ENV"
+          EXTENSION="${OBJECT_KEY##*.}"
+          echo "EXTENSION=$EXTENSION" >> "$GITHUB_ENV"
+          aws s3 cp "s3://${{ secrets.R2_BUCKET }}/$OBJECT_KEY" "video_original.$EXTENSION" \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+
+      - name: Detectar resolución/audio/subtítulos y convertir a HLS
+        run: |
+          SRC_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "video_original.$EXTENSION")
+          echo "Alto de origen detectado: ${SRC_HEIGHT}px"
+
+          HAS_AUDIO=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "video_original.$EXTENSION" | wc -l)
+          echo "Pistas de audio detectadas: $HAS_AUDIO"
+
+          SUB_COUNT=$(ffprobe -v error -select_streams s -show_entries stream=index -of csv=p=0 "video_original.$EXTENSION" | wc -l)
+          echo "Pistas de subtítulos detectadas: $SUB_COUNT"
+          if [ "$SUB_COUNT" -gt 0 ]; then
+            mapfile -t SUB_LANGS < <(ffprobe -v error -select_streams s -show_entries stream_tags=language -of csv=p=0 "video_original.$EXTENSION")
+          fi
+
+          # Escalones estándar + la resolución ORIGINAL como techo, sin importar
+          # qué tan alta sea (1440p, 4K, lo que traiga el video se respeta).
+          ESTANDAR=(480 720 1080 1440 2160)
+          ALTURAS=()
+          for r in "${ESTANDAR[@]}"; do
+            if [ "$r" -le "$SRC_HEIGHT" ]; then ALTURAS+=("$r"); fi
+          done
+          ULTIMA=${ALTURAS[-1]:-0}
+          if [ "$ULTIMA" -ne "$SRC_HEIGHT" ]; then ALTURAS+=("$SRC_HEIGHT"); fi
+          if [ ${#ALTURAS[@]} -eq 0 ]; then ALTURAS=("$SRC_HEIGHT"); fi
+          N=${#ALTURAS[@]}
+          echo "Calidades a generar: ${ALTURAS[*]}"
+
+          bitrate_para() {
+            case "$1" in
+              480)  echo 800k ;;
+              720)  echo 2800k ;;
+              1080) echo 5000k ;;
+              1440) echo 8000k ;;
+              2160) echo 14000k ;;
+              *)    echo "$(( $1 * 5 ))k" ;; # resolución no estándar (el techo original)
+            esac
+          }
+
+          mkdir -p hls_output
+          for i in $(seq 0 $((N-1))); do mkdir -p "hls_output/$i"; done
+
+          # Arma [0:v]split=N[v0][v1]...; [v0]scale=...[v0out]; ...
+          SPLIT_LABELS=""
+          FILTER_PARTS=""
+          for i in $(seq 0 $((N-1))); do
+            SPLIT_LABELS="${SPLIT_LABELS}[v${i}]"
+            FILTER_PARTS="${FILTER_PARTS}[v${i}]scale=w=-2:h=${ALTURAS[$i]}[v${i}out];"
+          done
+          FILTER_COMPLEX="[0:v]split=${N}${SPLIT_LABELS};${FILTER_PARTS}"
+
+          ffmpeg_args=(-i "video_original.$EXTENSION" -filter_complex "$FILTER_COMPLEX")
+          VARSTREAM=""
+
+          for i in $(seq 0 $((N-1))); do
+            BITRATE=$(bitrate_para "${ALTURAS[$i]}")
+            ffmpeg_args+=(-map "[v${i}out]" -c:v:$i libx264 -preset veryfast -crf 22 -b:v:$i "$BITRATE")
+            ENTRADA="v:${i}"
+            if [ "$HAS_AUDIO" -gt 0 ]; then
+              ffmpeg_args+=(-map a:0 -c:a:$i aac -b:a:$i 128k)
+              ENTRADA="${ENTRADA},a:${i}"
+            fi
+            if [ "$SUB_COUNT" -gt 0 ]; then
+              ENTRADA="${ENTRADA},sgroup:subs"
+            fi
+            VARSTREAM="${VARSTREAM}${ENTRADA},name:${ALTURAS[$i]}p "
+          done
+
+          # Cada pista de subtítulo se copia como WebVTT, conservando TODOS los
+          # idiomas que traiga el video (no solo uno).
+          if [ "$SUB_COUNT" -gt 0 ]; then
+            for j in $(seq 0 $((SUB_COUNT-1))); do
+              LANG="${SUB_LANGS[$j]:-und}"
+              [ -z "$LANG" ] && LANG="und"
+              ffmpeg_args+=(-map "0:s:$j" -c:s:$j webvtt)
+              VARSTREAM="${VARSTREAM}s:${j},sgroup:subs,name:${LANG},language:${LANG} "
+            done
+          fi
+
+          ffmpeg_args+=(-f hls -hls_time 6 -hls_playlist_type vod \
+            -hls_segment_filename "hls_output/%v/segmento_%03d.ts" \
+            -master_pl_name master.m3u8 \
+            -var_stream_map "$VARSTREAM" \
+            hls_output/%v/playlist.m3u8)
+
+          ffmpeg "${ffmpeg_args[@]}"
+
+      - name: Subir carpeta HLS a R2
+        run: |
+          aws s3 cp hls_output "s3://${{ secrets.R2_BUCKET }}/hls/${{ matrix.video.id }}/" \
+            --recursive \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+
+      - name: Borrar el archivo crudo de R2 (ya no hace falta)
+        if: success()
+        run: |
+          aws s3 rm "s3://${{ secrets.R2_BUCKET }}/$OBJECT_KEY" \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
